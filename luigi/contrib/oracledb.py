@@ -17,6 +17,7 @@
 
 # This module makes use of the f string formatting syntax, which requires Python 3.6 or higher
 
+import csv
 import logging
 
 import luigi
@@ -148,25 +149,97 @@ class OracleTarget(luigi.Target):
         connection.close()
 
 
-class OracleQuery(rdbms.Query):
+class CopyToTable(rdbms.CopyToTable):
     """
-    Template task for querying an Oracle compatible database
+    Template task for inserting a data set into Oracle
 
     Usage:
-    Subclass and override the required `host`, `database`, `user`, `password`, `table`, and `query` attributes.
-    Optionally one can override the `autocommit` attribute to put the connection for the query in autocommit mode.
+    Subclass and override the required `host`, `database`, `user`,
+    `password`, `table` and `columns` attributes.
 
-    Override the `run` method if your use case requires some action with the query result.
-
-    Task instances require a dynamic `update_id`, e.g. via parameter(s), otherwise the query will only execute once
-
-    To customize the query signature as recorded in the database marker table, override the `update_id` property.
+    To customize how to access data from an input task, override the `rows` method
+    with a generator that yields each row as a tuple with fields ordered according to `columns`.
     """
 
     def output(self):
         """
         Returns an OracleTarget to record execution in a marker table
 
+        Normally you don't override this.
+        """
+        return OracleTarget(
+            host=self.host,
+            database=self.database,
+            user=self.user,
+            password=self.password,
+            table=self.table,
+            update_id=self.update_id,
+            port=self.port
+        )
+
+    def copy(self, cursor):
+        if isinstance(self.columns[0], str):
+            column_names = self.columns
+            column_indices = [':' + str(x + 1) for x in range(len(self.columns))]
+        elif len(self.columns[0]) == 2:
+            column_names = [c[0] for c in self.columns]
+        else:
+            raise Exception('columns must consist of column strings or (column string, type string) tuples (was %r ...)' % (self.columns[0],))
+
+        insert_sql = f'INSERT INTO {self.table} ({",".join(column_names)}) VALUES ({",".join(column_indices)})'
+
+        with self.input().open('r') as f:
+            reader = csv.reader(f)
+            next(reader, None)
+            rows = [tuple(x) for x in reader]
+        cursor.executemany(insert_sql, rows)
+
+    def run(self):
+        """
+        This method manages the execution of the copying of records.
+
+        This can be enhanced such that if the target table does not exist it would create it, right now it just throws an error
+
+        You can also override the init_copy() and post_copy() methods to call any routines pre- and post- copying
+
+        Normally you don't want to override this.
+        """
+        if not (self.table and self.columns):
+            raise Exception("table and columns need to be specified")
+
+        connection = self.output().connect()
+        try:
+            cursor = connection.cursor()
+            self.init_copy(connection)
+            self.copy(cursor)
+            self.post_copy(connection)
+            if self.enable_metadata_columns:
+                self.post_copy_metacolumns(cursor)
+        except cx_Oracle.DatabaseError as e:
+            raise
+
+        # mark as complete in same transaction
+        self.output().touch(connection)
+
+        # commit and clean up
+        connection.commit()
+        connection.close()
+
+
+class OracleQuery(rdbms.Query):
+    """
+    Template task for querying an Oracle compatible database
+    Usage:
+    Subclass and override the required `host`, `database`, `user`, `password`, `table`, and `query` attributes.
+    Optionally one can override the `autocommit` attribute to put the connection for the query in autocommit mode.
+    Override the `run` method if your use case requires some action with the query result.
+    Task instances require a dynamic `update_id`, e.g. via parameter(s), otherwise the query will only execute once
+    To customize the query signature as recorded in the database marker table, override the `update_id` property.
+    """
+
+    def output(self):
+        """
+        Returns an OracleTarget to record execution in a marker table
         Normally you don't override this.
         """
         return OracleTarget(
